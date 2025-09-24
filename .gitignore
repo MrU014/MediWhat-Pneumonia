@@ -1,0 +1,25 @@
+# Datasets/Samples (re-download from Kaggle)
+test_images/
+__MACOSX/
+*.zip
+*.tar.gz
+
+# Python/Backend
+__pycache__/
+*.pyc
+.env
+backend/__pycache__/
+
+# Node/React/Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/build/
+frontend/dist/
+.DS_Store
+*.log
+
+# OS/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
