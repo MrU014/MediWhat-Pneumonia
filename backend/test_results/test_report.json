@@ -1,0 +1,85 @@
+{
+  "timestamp": "2025-11-05T03:38:01.886127",
+  "tests_passed": 15,
+  "tests_failed": 0,
+  "warnings": [
+    "Balanced accuracy: 82.78%",
+    "Noise sensitivity: 0.3748"
+  ],
+  "dataset_stats": {
+    "train": {
+      "normal": 1341,
+      "pneumonia": 1341,
+      "total": 2682,
+      "ratio": 1.0,
+      "balance_percentage": 100.0
+    },
+    "val": {
+      "normal": 8,
+      "pneumonia": 8,
+      "total": 16,
+      "ratio": 1.0,
+      "balance_percentage": 100.0
+    },
+    "test": {
+      "normal": 234,
+      "pneumonia": 390,
+      "total": 624,
+      "ratio": 1.6666666666666667,
+      "balance_percentage": 60.0
+    }
+  },
+  "model_info": {
+    "total_params": 2422593,
+    "trainable_params": 1690753,
+    "non_trainable_params": 731840,
+    "size_mb": 22.53369903564453,
+    "layers": 7
+  },
+  "performance_metrics": {
+    "accuracy": 0.8669871794871795,
+    "balanced_accuracy": 0.8277777777777777,
+    "precision": 0.8329718004338394,
+    "recall": 0.9846153846153847,
+    "specificity": 0.6709401709401709,
+    "f1_score": 0.9024676850763808,
+    "mcc": 0.7224461308982931,
+    "roc_auc": 0.966151654613193,
+    "pr_auc": 0.9794038268628819,
+    "confusion_matrix": {
+      "tn": 157,
+      "fp": 77,
+      "fn": 6,
+      "tp": 384
+    },
+    "error_rates": {
+      "fpr": 0.32905982905982906,
+      "fnr": 0.015384615384615385
+    }
+  },
+  "api_available": true,
+  "consistency_metrics": {
+    "repeatability_std": 0.0,
+    "repeatability_variance": 0.0,
+    "noise_sensitivity": 0.374764084815979,
+    "batch_consistency": 6.705522537231445e-08
+  },
+  "inference_speed": {
+    "single_image_ms": {
+      "mean": 201.72481536865234,
+      "median": 186.50758266448975,
+      "std": 63.59970909434361,
+      "min": 104.00652885437012,
+      "max": 471.6930389404297
+    },
+    "batch_ms": {
+      "mean_batch": 1077.25350856781,
+      "per_image": 33.664172142744064
+    },
+    "throughput": {
+      "single": 4.95724830964648,
+      "batch": 29.705171294863963
+    }
+  },
+  "gradcam_working": true
+}

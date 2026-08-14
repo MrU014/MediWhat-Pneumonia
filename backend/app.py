@@ -2,188 +2,222 @@ from flask import Flask, request, jsonify
 import tensorflow as tf
 import numpy as np
 from PIL import Image
-import io
-import base64
-import cv2
+import io, base64, cv2
 from flask_cors import CORS
 
 app = Flask(__name__)
 CORS(app)
 
-# Load the pre-trained model
-model = tf.keras.models.load_model('best_chest_xray_model.h5')
+print("Loading model...")
+model = tf.keras.models.load_model("pneumonia_model_balanced.h5")
 
-# Get the base MobileNetV2 sub-model
-base_model = model.get_layer('mobilenetv2_1.00_224')
-
-# Build the model with dummy input
-print("Building model with dummy input...")
+# CRITICAL: Build the model first
+print("Building model...")
 dummy_input = tf.random.normal((1, 224, 224, 3))
-_ = model.predict(dummy_input, verbose=0)
-print("Model built successfully.")
+_ = model(dummy_input)
+print("✅ Model ready")
 
-# GRAD-CAM function (higher threshold for focus)
-def get_gradcam_heatmap(img_array, model, base_model):
-    possible_layers = ['out_relu', 'Conv_1_relu', 'block_16_project_relu']
-    conv_layer = None
-    for layer_name in possible_layers:
-        try:
-            conv_layer = base_model.get_layer(layer_name)
-            print(f"Using layer: {layer_name}")
-            break
-        except ValueError:
-            continue
+# Get the base model
+base_model = model.layers[0]
+
+# Find last conv layer ONCE at startup
+last_conv_layer = None
+for layer in reversed(base_model.layers):
+    if isinstance(layer, tf.keras.layers.Conv2D):
+        last_conv_layer = layer.name
+        break
+
+print(f"✅ Using conv layer for Grad-CAM: {last_conv_layer}")
+
+def preprocess(file):
+    img = Image.open(io.BytesIO(file.read())).convert("RGB").resize((224, 224))
+    arr = np.array(img) / 255.0
+    return img, np.expand_dims(arr.astype(np.float32), axis=0)
+
+# ------------------ WORKING Grad-CAM -------------------
+def gradcam(img_array):
+    """
+    Generate Grad-CAM heatmap using the correct approach
+    """
+    # Convert to tensor
+    img_tensor = tf.convert_to_tensor(img_array)
     
-    if conv_layer is None:
-        raise ValueError("No suitable conv layer found")
-    
-    grad_model = tf.keras.models.Model(
-        [model.inputs], 
-        [conv_layer.output, model.output]
+    # Create a model that maps from input to conv output AND final prediction
+    # KEY: Use base_model.input (the Functional model has proper input)
+    grad_model = tf.keras.Model(
+        inputs=base_model.input,
+        outputs=[base_model.get_layer(last_conv_layer).output, base_model.output]
     )
     
+    # Watch the gradients
     with tf.GradientTape() as tape:
-        tape.watch(model.inputs)
-        conv_outputs, predictions = grad_model(img_array)
-        class_channel = predictions[0, 0]
+        # Get conv outputs and predictions
+        last_conv_output, base_predictions = grad_model(img_tensor)
+        
+        # Pass base output through the rest of the model
+        x = model.layers[1](base_predictions)  # GlobalAveragePooling2D
+        x = model.layers[2](x, training=False)  # Dropout
+        x = model.layers[3](x)  # Dense
+        x = model.layers[4](x, training=False)  # BatchNormalization
+        x = model.layers[5](x, training=False)  # Dropout
+        predictions = model.layers[6](x)  # Final Dense
+        
+        # Get the score for pneumonia class
+        class_channel = predictions[:, 0]
     
-    grads = tape.gradient(class_channel, conv_outputs)
-    if grads is None:
-        raise ValueError("Gradients are None")
+    # Compute gradient of class score with respect to conv output
+    grads = tape.gradient(class_channel, last_conv_output)
     
+    # Global average pooling on gradients
     pooled_grads = tf.reduce_mean(grads, axis=(0, 1, 2))
-    conv_outputs = conv_outputs[0]
-    heatmap = tf.reduce_sum(tf.multiply(conv_outputs, pooled_grads[:, tf.newaxis, tf.newaxis]), axis=-1)
     
-    heatmap = tf.nn.relu(heatmap)
-    max_val = tf.reduce_max(heatmap)
-    if max_val > 0:
-        heatmap /= max_val
+    # Weight feature maps by gradient importance
+    last_conv_output = last_conv_output[0].numpy()
+    pooled_grads = pooled_grads.numpy()
+    
+    # Compute weighted combination
+    heatmap = np.zeros(last_conv_output.shape[:2], dtype=np.float32)
+    for i in range(pooled_grads.shape[0]):
+        heatmap += pooled_grads[i] * last_conv_output[:, :, i]
+    
+    # ReLU
+    heatmap = np.maximum(heatmap, 0)
+    
+    # Normalize
+    if np.max(heatmap) != 0:
+        heatmap = heatmap / np.max(heatmap)
+    
+    # Resize to input size
+    heatmap = cv2.resize(heatmap, (224, 224))
+    
+    # Smooth
+    heatmap = cv2.GaussianBlur(heatmap, (11, 11), 0)
+    
+    return heatmap
+
+def overlay_heat(heat, img):
+    """Create overlay of heatmap on original image"""
+    img_array = np.array(img).astype("uint8")
+    
+    # Apply JET colormap
+    heat_uint8 = np.uint8(255 * heat)
+    heat_colored = cv2.applyColorMap(heat_uint8, cv2.COLORMAP_JET)
+    heat_colored = cv2.cvtColor(heat_colored, cv2.COLOR_BGR2RGB)
+    
+    # Blend
+    overlayed = cv2.addWeighted(img_array, 0.6, heat_colored, 0.4, 0)
+    
+    return overlayed
+
+def explain(diag, conf, heat):
+    """Generate explanation"""
+    h, w = heat.shape
+    
+    # Analyze lung regions
+    left_region = heat[int(.2*h):int(.8*h), int(.2*w):int(.45*w)]
+    right_region = heat[int(.2*h):int(.8*h), int(.55*w):int(.8*w)]
+    
+    left_intensity = np.mean(left_region)
+    right_intensity = np.mean(right_region)
+    
+    lung_side = "left" if left_intensity > right_intensity else "right"
+    overall_intensity = np.mean(heat)
+    
+    if diag == "PNEUMONIA":
+        if overall_intensity > 0.5:
+            intensity_desc = "strong"
+        elif overall_intensity > 0.3:
+            intensity_desc = "moderate"
+        else:
+            intensity_desc = "mild"
+        
+        return (f"⚠️ Pneumonia detected with {conf} confidence. "
+                f"The model shows {intensity_desc} activation in the {lung_side} lung region. "
+                f"This is NOT a medical diagnosis - please consult a healthcare professional.")
     else:
-        heatmap = tf.zeros_like(heatmap)
-    
-    # Upsample
-    heatmap = tf.image.resize(heatmap[tf.newaxis, ..., tf.newaxis], [224, 224], method='bilinear')[0, :, :, 0]
-    
-    # Stats
-    heatmap_np = heatmap.numpy()
-    orig_max = np.max(heatmap_np)
-    orig_mean = np.mean(heatmap_np)
-    print(f"Heatmap stats (pre-boost) - Max: {orig_max:.3f}, Mean: {orig_mean:.3f}")
-    
-    # Conservative boost only if very low
-    boosted = False
-    if orig_max < 0.15:
-        boost_factor = min(1.3, 1.0 / orig_max if orig_max > 0 else 1.0)  # Milder cap
-        heatmap_np = np.clip(heatmap_np * boost_factor, 0, 1)
-        boosted = True
-        print(f"Mild boost by {boost_factor:.1f}x, new max: {np.max(heatmap_np):.3f}")
-    
-    # Aggressive threshold: <0.2 to 0 (focus on strong hotspots only)
-    low_mask = heatmap_np < 0.2
-    heatmap_np[low_mask] = 0
-    hotspot_pct = (1 - np.mean(low_mask)) * 100  # % above threshold
-    print(f"Applied threshold <0.2 to 0. Boosted: {boosted}, Hotspots cover {hotspot_pct:.1f}% of image")
-    
-    return heatmap_np
+        return (f"✅ No pneumonia detected with {conf} confidence. "
+                f"The X-ray appears normal with no significant abnormalities. "
+                f"This is NOT a medical diagnosis - please consult a healthcare professional.")
 
-# Overlay with selective, subtle application (no filter effect)
-def overlay_heatmap(heatmap, original_img):
-    original_np = np.array(original_img, dtype=np.uint8)  # RGB uint8
-    
-    # Resize heatmap
-    heatmap_resized = cv2.resize(heatmap, (224, 224))
-    
-    # Create mask for high activations only (>0.3 for color)
-    high_mask = (heatmap_resized > 0.3).astype(np.uint8) * 255
-    low_mask = 255 - high_mask  # For low areas (no color)
-    
-    # Apply HOT colormap (black-low to red-high, less blue flood)
-    heatmap_normalized = np.uint8(255 * heatmap_resized)
-    heatmap_colored_bgr = cv2.applyColorMap(heatmap_normalized, cv2.COLORMAP_HOT)
-    heatmap_colored_rgb = cv2.cvtColor(heatmap_colored_bgr, cv2.COLOR_BGR2RGB)
-    
-    # Selective blend: High areas get color, low areas stay original
-    high_blend = cv2.addWeighted(original_np, 0.6, heatmap_colored_rgb, 0.4, 0)
-    low_blend = original_np  # No overlay for low
-    
-    # Combine using masks
-    superimposed = np.where(high_mask[..., np.newaxis] > 0, high_blend, low_blend)
-    
-    # Final subtle global alpha on the whole (0.9 original + 0.1 color for faint tint)
-    superimposed = cv2.addWeighted(original_np, 0.9, superimposed.astype(np.uint8), 0.1, 0)
-    
-    print("Selective subtle overlay applied (HOT colormap, thresholded hotspots only, 0.9 original + 0.1 color)")
-    return superimposed.astype(np.uint8)
-
-# Fallback: Very subtle tint on grayscale
-def get_fallback_image(original_img):
-    original_np = np.array(original_img, dtype=np.uint8)
-    gray = cv2.cvtColor(original_np, cv2.COLOR_RGB2GRAY)
-    gray_3ch = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
-    
-    # Minimal uniform low heatmap (faint warm tint)
-    uniform_heatmap = np.full((224, 224), 0.05)  # Extremely low
-    uniform_heatmap[uniform_heatmap < 0.05] = 0
-    heatmap_normalized = np.uint8(255 * uniform_heatmap)
-    heatmap_colored_bgr = cv2.applyColorMap(heatmap_normalized, cv2.COLORMAP_HOT)
-    heatmap_colored_rgb = cv2.cvtColor(heatmap_colored_bgr, cv2.COLOR_BGR2RGB)
-    
-    fallback = cv2.addWeighted(gray_3ch, 0.95, heatmap_colored_rgb, 0.05, 0)  # Almost invisible tint
-    return fallback
-
-# Preprocess
-def preprocess_image(image_file):
-    image_bytes = image_file.read()
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB").resize((224, 224))
-    img_array = np.array(img) / 255.0
-    return img, np.expand_dims(img_array, axis=0)
-
-@app.route('/predict', methods=['POST'])
+# ------------------ API -------------------
+@app.route("/predict", methods=["POST"])
 def predict():
-    if 'file' not in request.files:
-        return jsonify({'error': 'No file uploaded'}), 400
+    if "file" not in request.files:
+        return jsonify({"error": "No file provided"}), 400
     
-    file = request.files['file']
-    if file.filename == '':
-        return jsonify({'error': 'No file selected'}), 400
-    
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"error": "Empty filename"}), 400
+
     try:
-        original_img, img_array = preprocess_image(file)
+        # Preprocess
+        img, arr = preprocess(file)
         
-        probability = model.predict(img_array, verbose=0)[0][0]
-        diagnosis = "PNEUMONIA" if probability >= 0.5 else "NORMAL"
-        confidence = f"{(probability * 100 if diagnosis == 'PNEUMONIA' else (1 - probability) * 100):.1f}%"
+        # Predict
+        prediction = model.predict(arr, verbose=0)[0][0]
         
-        heatmap_data = None
+        # Format results
+        diag = "PNEUMONIA" if prediction >= 0.5 else "NORMAL"
+        confidence_value = prediction * 100 if diag == "PNEUMONIA" else (1 - prediction) * 100
+        conf = f"{confidence_value:.1f}%"
+        
+        print(f"Prediction: {diag} ({conf}) - raw score: {prediction:.4f}")
+        
+        # Generate Grad-CAM
         try:
-            heatmap = get_gradcam_heatmap(img_array, model, base_model)
-            overlaid_img = overlay_heatmap(heatmap, original_img)
+            heatmap = gradcam(arr)
+            overlay = overlay_heat(heatmap, img)
             
-            success, buffer = cv2.imencode('.png', overlaid_img)
-            if not success:
-                raise ValueError("Encoding failed")
-            
+            # Encode to base64
+            _, buffer = cv2.imencode(".png", cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
             img_base64 = base64.b64encode(buffer).decode('utf-8')
-            heatmap_data = f"data:image/png;base64,{img_base64}"
+            img_uri = f"data:image/png;base64,{img_base64}"
             
-            print(f"Full GRAD-CAM heatmap generated: {len(img_base64)} characters")
+            explanation = explain(diag, conf, heatmap)
             
-        except Exception as grad_error:
-            print(f"GRAD-CAM failed: {grad_error}")
-            fallback_img = get_fallback_image(original_img)
-            success, buffer = cv2.imencode('.png', fallback_img)
+            print("✅ Grad-CAM generated successfully")
+            
+        except Exception as e:
+            print(f"⚠️ Grad-CAM failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Fallback
+            img_array = np.array(img)
+            _, buffer = cv2.imencode(".png", cv2.cvtColor(img_array, cv2.COLOR_RGB2BGR))
             img_base64 = base64.b64encode(buffer).decode('utf-8')
-            heatmap_data = f"data:image/png;base64,{img_base64}"
-            print(f"Fallback minimal tint generated: {len(img_base64)} characters")
+            img_uri = f"data:image/png;base64,{img_base64}"
+            
+            explanation = f"{diag} ({conf}). Heatmap unavailable."
         
         return jsonify({
-            'diagnosis': diagnosis,
-            'confidence': confidence,
-            'heatmap_image': heatmap_data
+            "diagnosis": diag,
+            "confidence": conf,
+            "raw_score": float(prediction),
+            "heatmap_image": img_uri,
+            "explanation": explanation
         })
+    
     except Exception as e:
-        return jsonify({'error': f'Prediction failed: {str(e)}'}), 500
+        print(f"❌ Error: {e}")
+        import traceback
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
-    app.run(debug=True, port=5000)
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({
+        "status": "healthy",
+        "model_loaded": True
+    })
+
+if __name__ == "__main__":
+    print("\n" + "="*80)
+    print("🏥 Pneumonia Detection API")
+    print("="*80)
+    print("Endpoints:")
+    print("  POST /predict - Upload X-ray for analysis")
+    print("  GET  /health  - Check API status")
+    print("="*80 + "\n")
+    
+    app.run(debug=True, port=5000, host='0.0.0.0')

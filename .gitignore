@@ -1,5 +1,6 @@
 # Datasets/Samples (re-download from Kaggle)
 test_images/
+chest_xray_balanced/
 __MACOSX/
 *.zip
 *.tar.gz
